@@ -200,7 +200,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges} When using ${toolNames.edit} with multiple edits in one call: all edits[].oldText values are matched against the ORIGINAL file content simultaneously, not sequentially. If edit #2 depends on edit #1's result, use two separate ${toolNames.edit} calls instead. Each edits[].oldText must be unique in the file; if the same text appears multiple times, include additional surrounding context to make it unique. Overlapping edits[].oldText ranges are rejected — merge overlapping or nearby changes into a single edit with a larger oldText.`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -307,6 +307,32 @@ function logFailedToolResponse(
 
 function textBlock(text: string): ToolContent {
   return { type: "text", text };
+}
+
+function enrichEditError(content: ToolContent[], path: string, editsCount: number): ToolContent[] {
+  const errorText = contentText(content);
+  const suffixLines: string[] = [];
+
+  if (/oldText must not be empty/i.test(errorText)) {
+    suffixLines.push(`Suggestion: One of your edits[].oldText values was empty. Each oldText must contain the exact text to replace, even if only a single character.`);
+  } else if (/Could not find the exact text|Could not find edits/i.test(errorText)) {
+    if (editsCount > 1) {
+      suffixLines.push(`Suggestion: All edits[].oldText must exist in the original file simultaneously. If later edits depend on changes from earlier edits in this same call, split them into separate edit calls.`);
+    }
+    suffixLines.push(`Suggestion: Use read to re-check the exact content of ${path} around the target area, then retry with the exact text including whitespace. Check that line endings match.`);
+  } else if (/Found \d+ occurrences|must be unique/i.test(errorText)) {
+    suffixLines.push(`Suggestion: Include more surrounding context in oldText to make it unique within ${path} — add a line or two above and below the target text.`);
+  } else if (/overlap/i.test(errorText)) {
+    suffixLines.push(`Suggestion: Merge the overlapping edits into a single edit with a larger oldText spanning the entire changed region.`);
+  } else if (/No changes made/i.test(errorText)) {
+    suffixLines.push(`Suggestion: This means oldText and newText produce identical output. Either the file already has the desired content (no action needed), or oldText doesn't match what you intended.`);
+  } else if (/Could not edit file/i.test(errorText)) {
+    suffixLines.push(`Suggestion: The file may not exist or may not be readable/writable. Check the path is correct with ls or read.`);
+  }
+
+  if (suffixLines.length === 0) return content;
+
+  return [...content, textBlock(""), textBlock(suffixLines.join("\n"))];
 }
 
 function textSummary(content: ToolContent[]): {
@@ -813,7 +839,14 @@ function createMcpServer(
     {
       title: "Edit file",
       description:
-        `Edit one file inside an open workspace by replacing exact text blocks. Prefer this over ${toolNames.write} for targeted changes. Each oldText must match a unique, non-overlapping region of the original file; merge nearby changes into one edit and keep oldText as small as possible while still unique. Call open_workspace first and pass workspaceId.`,
+        `Edit one file inside an open workspace by replacing exact text blocks. Prefer this over ${toolNames.write} for targeted changes. Call open_workspace first and pass workspaceId.
+
+IMPORTANT matching rules:
+1. All edits[].oldText are matched against the ORIGINAL file — not after earlier edits are applied. If edit #2 depends on edit #1, split them into two separate ${toolNames.edit} calls.
+2. Each edits[].oldText must match exactly once in the file (including whitespace and newlines). If the same text appears multiple times, include surrounding context to make it unique.
+3. Overlapping edits[].oldText ranges are rejected. Merge overlapping or touching changes into a single edit.
+4. edits[].oldText must not be empty.
+5. If no changes result, the call is rejected.`,
       inputSchema: {
         workspaceId: z
           .string()
@@ -850,12 +883,13 @@ function createMcpServer(
       });
 
       if (response.isError) {
+        const enrichedContent = enrichEditError(response.content, input.path, input.edits.length);
         logFailedToolResponse(config, {
           tool: toolNames.edit,
           workspaceId,
           path: input.path,
-        }, response.content, startedAt);
-        return response;
+        }, enrichedContent, startedAt);
+        return { ...response, content: enrichedContent };
       }
 
       const stats = countDiffStats(
@@ -1382,37 +1416,51 @@ export function createServer(config = loadConfig()): RunningServer {
       if (sessionId) {
         transport = transports.get(sessionId);
         if (!transport) {
-          sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
-          return;
-        }
-      } else if (initializeRequest) {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            if (transport) transports.set(newSessionId, transport);
-            logEvent(config.logging, "info", "mcp_session_created", {
+          if (initializeRequest) {
+            transports.delete(sessionId);
+            logEvent(config.logging, "info", "mcp_session_resumed", {
               requestId,
-              sessionIdPrefix: sessionIdPrefix(newSessionId),
+              sessionIdPrefix: sessionIdPrefix(sessionId),
+              reason: "stale_session_reinit",
               ...requestLogFields(req, config),
             });
-          },
-        });
-
-        transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId) {
-            transports.delete(closedSessionId);
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
+          } else {
+            sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
+            return;
           }
-        };
+        }
+      }
 
-        const server = createMcpServer(config, workspaces, reviewCheckpoints);
-        await server.connect(transport);
-      } else {
-        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
-        return;
+      if (!transport) {
+        if (initializeRequest) {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (newSessionId) => {
+              if (transport) transports.set(newSessionId, transport);
+              logEvent(config.logging, "info", "mcp_session_created", {
+                requestId,
+                sessionIdPrefix: sessionIdPrefix(newSessionId),
+                ...requestLogFields(req, config),
+              });
+            },
+          });
+
+          transport.onclose = () => {
+            const closedSessionId = transport?.sessionId;
+            if (closedSessionId) {
+              transports.delete(closedSessionId);
+              logEvent(config.logging, "info", "mcp_session_closed", {
+                sessionIdPrefix: sessionIdPrefix(closedSessionId),
+              });
+            }
+          };
+
+          const server = createMcpServer(config, workspaces, reviewCheckpoints);
+          await server.connect(transport);
+        } else {
+          sendJsonRpcError(res, 400, -32000, "No valid MCP session");
+          return;
+        }
       }
 
       await transport.handleRequest(req, res, req.body);

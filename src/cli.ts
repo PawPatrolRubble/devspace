@@ -14,6 +14,7 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import { startCloudflareTunnel } from "./tunnel.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -22,13 +23,15 @@ const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
 
-  const [rawCommand, ...args] = argv;
+  const useTunnel = parseTunnelFlag(argv);
+  const filteredArgs = argv.filter((arg) => arg !== "--tunnel");
+  const [rawCommand, ...args] = filteredArgs;
   const command = normalizeCommand(rawCommand);
 
   switch (command) {
     case "serve":
       await ensureConfigured();
-      await serve();
+      await serve({ useTunnel });
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -166,7 +169,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   }
 }
 
-async function serve(): Promise<void> {
+async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
   const sqliteStatus = checkSqliteNative();
   if (sqliteStatus !== "ok") {
     throw new Error(
@@ -180,22 +183,49 @@ async function serve(): Promise<void> {
     );
   }
 
+  let tunnelProcess: import("node:child_process").ChildProcess | undefined;
+
+  if (opts.useTunnel) {
+    const config = loadConfig();
+    process.stdout.write("Starting Cloudflare tunnel... ");
+
+    try {
+      const tunnel = await startCloudflareTunnel(config.port);
+      tunnelProcess = tunnel.process;
+      process.env.DEVSPACE_PUBLIC_BASE_URL = tunnel.url;
+      console.log(`\n  Tunnel: ${tunnel.url}`);
+      console.log(`  MCP URL: ${tunnel.url}/mcp`);
+      console.log(`  ─────────────────────────────────────────────`);
+    } catch (error) {
+      console.log("");
+      throw error;
+    }
+  }
+
   const { createServer } = await import("./server.js");
   const config = loadConfig();
   const { app, close } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
-    console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
-    console.log(`public base url: ${config.publicBaseUrl}`);
-    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
+    const publicMcpUrl = new URL("/mcp", config.publicBaseUrl).toString();
+    console.log(`\n  DevSpace server started`);
+    console.log(`  ─────────────────────────────────────────────`);
+    console.log(`  Local:  http://${config.host}:${config.port}/mcp`);
+    console.log(`  Public: ${publicMcpUrl}`);
+    console.log(`  ─────────────────────────────────────────────`);
+    console.log(`  Allowed roots: ${config.allowedRoots.join(", ")}`);
     if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
+      console.warn("  ⚠  Host header allowlist disabled (DEVSPACE_ALLOWED_HOSTS=*)");
     }
-    console.log("auth: Owner password approval required");
-    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    console.log(`  Auth: Owner password required`);
+    console.log(`  Logs: ${config.logging.level} ${config.logging.format}`);
+    console.log();
   });
 
   const shutdown = () => {
+    if (tunnelProcess) {
+      tunnelProcess.kill();
+      console.log("cloudflared tunnel closed.");
+    }
     httpServer.close(() => {
       close();
       process.exit(0);
@@ -262,15 +292,20 @@ function printHelp(): void {
       "DevSpace",
       "",
       "Usage:",
-      "  devspace                 Run first-time setup if needed, then start the server",
-      "  devspace serve           Start the server",
-      "  devspace init            Create or update ~/.devspace/config.json and auth.json",
-      "  devspace doctor          Show config, runtime, and native dependency status",
-      "  devspace config get      Print persisted config",
+      "  devspace                      Run first-time setup if needed, then start the server",
+      "  devspace serve [--tunnel]     Start the server",
+      "  devspace init                 Create or update ~/.devspace/config.json and auth.json",
+      "  devspace doctor               Show config, runtime, and native dependency status",
+      "  devspace config get           Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
-      "  devspace -v, --version   Print the installed version",
+      "  devspace -v, --version        Print the installed version",
       "",
-      "For temporary tunnels:",
+      "Options:",
+      "  --tunnel                      Automatically start a Cloudflare quick tunnel and use",
+      "                                the returned URL as DEVSPACE_PUBLIC_BASE_URL.",
+      "                                Requires: cloudflared installed and on PATH.",
+      "",
+      "For manual tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
     ].join("\n"),
   );
@@ -299,6 +334,10 @@ function normalizePublicBaseUrl(value: string): string {
   parsed.search = "";
   parsed.pathname = parsed.pathname.replace(/\/+$/, "");
   return parsed.toString().replace(/\/$/, "");
+}
+
+function parseTunnelFlag(args: string[]): boolean {
+  return args.includes("--tunnel");
 }
 
 type TextPromptOptions = Omit<Parameters<typeof prompts.text>[0], "validate"> & {

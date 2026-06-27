@@ -1,12 +1,15 @@
 import { spawn } from "node:child_process";
 import { readdirSync, statSync, watch } from "node:fs";
 import { join, resolve } from "node:path";
+import { platform } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const watchRoots = ["src"].map((entry) => join(repoRoot, entry));
 const restartDelayMs = 750;
 const crashDelayMs = 1500;
+const isWindows = platform() === "win32";
+const extraArgs = process.argv.slice(2);
 
 let child;
 let restartTimer;
@@ -19,10 +22,11 @@ function log(message) {
 
 function start() {
   stoppingForRestart = false;
-  child = spawn("npx", ["tsx", "src/cli.ts", "serve"], {
+  child = spawn("npx", ["tsx", "src/cli.ts", "serve", ...extraArgs], {
     cwd: repoRoot,
     env: process.env,
     stdio: "inherit",
+    shell: isWindows,
   });
 
   child.on("exit", (code, signal) => {
@@ -40,6 +44,20 @@ function scheduleRestart(delayMs = restartDelayMs) {
   restartTimer = setTimeout(restart, delayMs);
 }
 
+function killChild(force = false) {
+  if (!child) return;
+  if (isWindows) {
+    // Windows: SIGTERM/SIGKILL not supported; use taskkill for force
+    if (force) {
+      spawn("taskkill", ["/pid", String(child.pid), "/f", "/t"], { windowsHide: true });
+    } else {
+      child.kill();
+    }
+  } else {
+    child.kill(force ? "SIGKILL" : "SIGTERM");
+  }
+}
+
 function restart() {
   if (shuttingDown) return;
   clearTimeout(restartTimer);
@@ -53,10 +71,10 @@ function restart() {
   child.once("exit", () => {
     if (!shuttingDown) start();
   });
-  child.kill("SIGTERM");
+  killChild(false);
 
   setTimeout(() => {
-    if (child && stoppingForRestart) child.kill("SIGKILL");
+    if (child && stoppingForRestart) killChild(true);
   }, 3000).unref();
 }
 
@@ -104,7 +122,7 @@ function shutdown() {
   if (!child) return process.exit(0);
 
   child.once("exit", () => process.exit(0));
-  child.kill("SIGTERM");
+  killChild(false);
   setTimeout(() => process.exit(1), 3000).unref();
 }
 
