@@ -83,6 +83,12 @@ export class WorkspaceRegistry {
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
+      try {
+        this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+      } catch (error) {
+        this.workspaces.delete(workspaceId);
+        throw error;
+      }
       this.store?.touchSession(workspaceId);
       return workspace;
     }

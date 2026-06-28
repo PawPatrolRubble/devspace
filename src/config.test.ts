@@ -130,12 +130,12 @@ assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
 
 assert.equal(
-  loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/" }).publicBaseUrl,
-  "https://abc.trycloudflare.com",
+  loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.taildea223.ts.net/" }).publicBaseUrl,
+  "https://abc.taildea223.ts.net",
 );
 assert.deepEqual(
-  loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/" }).allowedHosts,
-  ["localhost", "127.0.0.1", "::1", "abc.trycloudflare.com"],
+  loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.taildea223.ts.net/" }).allowedHosts,
+  ["localhost", "127.0.0.1", "::1", "abc.taildea223.ts.net"],
 );
 assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_ALLOWED_HOSTS: "*" }).allowedHosts,

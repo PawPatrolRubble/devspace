@@ -103,6 +103,9 @@ Short names are the default:
 - `read`
 - `write`
 - `edit`
+- `git_status`
+- `git_diff`
+- `git_log`
 - `bash`
 
 By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
@@ -115,6 +118,9 @@ Legacy names are available with `DEVSPACE_TOOL_NAMING=legacy`:
 - `read_file`
 - `write_file`
 - `edit_file`
+- `git_status`
+- `git_diff`
+- `git_log`
 - `run_shell`
 
 Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
@@ -131,11 +137,12 @@ to expose the aggregate show-changes flow.
 
 ## Shell Use
 
+Use `git_status`, `git_diff`, and `git_log` for read-only Git inspection.
+
 The shell tool is for commands that belong in a terminal:
 
 - tests
 - builds
-- git inspection
 - package scripts
 - environment checks
 

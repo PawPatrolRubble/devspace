@@ -9,10 +9,11 @@ projects through DevSpace.
 - npm
 - Git
 - Bash, including Git Bash or WSL on Windows
-- a public HTTPS URL that forwards to the local DevSpace server
+- Tailscale with Funnel enabled, or another public HTTPS URL that forwards to the
+  local DevSpace server
 
-DevSpace does not create the public tunnel for you. Use Cloudflare Tunnel,
-ngrok, Pinggy, Tailscale Funnel, or your own HTTPS reverse proxy.
+DevSpace can configure Tailscale Funnel when started with `--tunnel`. You can
+also use ngrok, Pinggy, Cloudflare Tunnel, or your own HTTPS reverse proxy.
 
 ## Install And Configure
 
@@ -55,8 +56,14 @@ http://127.0.0.1:7676/mcp
 
 ### Public Base URL
 
-Start your tunnel or reverse proxy before entering this value. Point the tunnel
-at:
+With Tailscale Funnel, you can let DevSpace configure this when it starts:
+
+```bash
+npx @waishnav/devspace serve --tunnel
+```
+
+For another tunnel or reverse proxy, start it before entering this value. Point
+the tunnel at:
 
 ```text
 http://127.0.0.1:7676
@@ -65,13 +72,13 @@ http://127.0.0.1:7676
 Enter the public origin without `/mcp`:
 
 ```text
-https://your-tunnel-host.example.com
+https://your-machine.your-tailnet.ts.net
 ```
 
 Configure the MCP client with the full MCP endpoint:
 
 ```text
-https://your-tunnel-host.example.com/mcp
+https://your-machine.your-tailnet.ts.net/mcp
 ```
 
 ## Start The Server
@@ -82,10 +89,17 @@ Run:
 npx @waishnav/devspace serve
 ```
 
+To configure Tailscale Funnel automatically and persist the discovered public
+URL, run:
+
+```bash
+npx @waishnav/devspace serve --tunnel
+```
+
 If your tunnel URL changes for one run, override it without rewriting config:
 
 ```bash
-DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @waishnav/devspace serve
+DEVSPACE_PUBLIC_BASE_URL="https://new-machine.your-tailnet.ts.net" npx @waishnav/devspace serve
 ```
 
 For a stable public URL, persist it:

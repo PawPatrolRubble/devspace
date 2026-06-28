@@ -2,6 +2,7 @@
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
@@ -14,7 +15,7 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
-import { startCloudflareTunnel } from "./tunnel.js";
+import { startTailscaleFunnel } from "./tunnel.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -115,7 +116,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
     prompts.note(
       [
         "DevSpace needs a public base URL so ChatGPT or Claude can reach this MCP server.",
-        "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
+        "Create a tunnel or reverse proxy with Tailscale Funnel, ngrok, Pinggy, Cloudflare Tunnel, or your own HTTPS proxy.",
         "Paste the public origin here, without /mcp.",
         "",
         "Example: https://your-tunnel-host.example.com",
@@ -183,18 +184,17 @@ async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
     );
   }
 
-  let tunnelProcess: import("node:child_process").ChildProcess | undefined;
-
   if (opts.useTunnel) {
     const config = loadConfig();
-    process.stdout.write("Starting Cloudflare tunnel... ");
+    process.stdout.write("Starting Tailscale Funnel... ");
 
     try {
-      const tunnel = await startCloudflareTunnel(config.port);
-      tunnelProcess = tunnel.process;
+      const tunnel = await startTailscaleFunnel(config.port);
       process.env.DEVSPACE_PUBLIC_BASE_URL = tunnel.url;
+      const configPath = persistPublicBaseUrlSetting(normalizePublicBaseUrl(tunnel.url));
       console.log(`\n  Tunnel: ${tunnel.url}`);
       console.log(`  MCP URL: ${tunnel.url}/mcp`);
+      console.log(`  Config: ${configPath}`);
       console.log(`  ─────────────────────────────────────────────`);
     } catch (error) {
       console.log("");
@@ -206,11 +206,13 @@ async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
   const config = loadConfig();
   const { app, close } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
+    const localBaseUrl = localHttpBaseUrl(config.host, config.port);
     const publicMcpUrl = new URL("/mcp", config.publicBaseUrl).toString();
     console.log(`\n  DevSpace server started`);
     console.log(`  ─────────────────────────────────────────────`);
-    console.log(`  Local:  http://${config.host}:${config.port}/mcp`);
+    console.log(`  Local:  ${new URL("/mcp", localBaseUrl).toString()}`);
     console.log(`  Public: ${publicMcpUrl}`);
+    console.log(`  Console: ${new URL("/app", localBaseUrl).toString()}`);
     console.log(`  ─────────────────────────────────────────────`);
     console.log(`  Allowed roots: ${config.allowedRoots.join(", ")}`);
     if (config.allowedHosts.includes("*")) {
@@ -222,10 +224,6 @@ async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
   });
 
   const shutdown = () => {
-    if (tunnelProcess) {
-      tunnelProcess.kill();
-      console.log("cloudflared tunnel closed.");
-    }
     httpServer.close(() => {
       close();
       process.exit(0);
@@ -233,6 +231,25 @@ async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
+}
+
+function localHttpBaseUrl(host: string, port: number): string {
+  const publicHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
+  const formattedHost = publicHost.includes(":") && !publicHost.startsWith("[")
+    ? `[${publicHost}]`
+    : publicHost;
+  return `http://${formattedHost}:${port}`;
+}
+
+export function persistPublicBaseUrlSetting(
+  publicBaseUrl: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const files = loadDevspaceFiles(env);
+  return writeDevspaceConfig({
+    ...files.config,
+    publicBaseUrl,
+  }, env);
 }
 
 async function runDoctor(): Promise<void> {
@@ -279,10 +296,7 @@ function runConfigCommand(args: string[]): void {
     throw new Error("Missing publicBaseUrl value.");
   }
 
-  writeDevspaceConfig({
-    ...files.config,
-    publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-  });
+  persistPublicBaseUrlSetting(normalizeOptionalPublicBaseUrl(value));
   console.log(`Updated ${files.configPath}`);
 }
 
@@ -301,12 +315,13 @@ function printHelp(): void {
       "  devspace -v, --version        Print the installed version",
       "",
       "Options:",
-      "  --tunnel                      Automatically start a Cloudflare quick tunnel and use",
-      "                                the returned URL as DEVSPACE_PUBLIC_BASE_URL.",
-      "                                Requires: cloudflared installed and on PATH.",
+      "  --tunnel                      Automatically configure Tailscale Funnel and use",
+      "                                the returned URL as DEVSPACE_PUBLIC_BASE_URL and persist it",
+      "                                to config.json.",
+      "                                Requires: tailscale installed and Funnel enabled.",
       "",
       "For manual tunnels:",
-      "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
+      "  DEVSPACE_PUBLIC_BASE_URL=https://machine.tailnet.ts.net devspace serve",
     ].join("\n"),
   );
 }
@@ -432,7 +447,14 @@ function checkBashShell(): string {
   }
 }
 
-main(process.argv.slice(2)).catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-});
+function isMainModule(): boolean {
+  const entryPath = process.argv[1];
+  return Boolean(entryPath) && import.meta.url === pathToFileURL(entryPath).href;
+}
+
+if (isMainModule()) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

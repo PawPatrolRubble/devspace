@@ -105,6 +105,21 @@ try {
   assert.equal(restoredWorktree.worktree?.managed, true);
   secondStore.close();
 
+  const narrowedConfig = loadConfig({
+    DEVSPACE_ALLOWED_ROOTS: gitRoot,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".devspace", "narrowed-worktrees"),
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const narrowedRegistry = new WorkspaceRegistry(narrowedConfig);
+  const formerlyAllowedWorkspace = await narrowedRegistry.openWorkspace(gitRoot);
+  narrowedConfig.allowedRoots = [join(root, "nested")];
+  assert.throws(
+    () => narrowedRegistry.getWorkspace(formerlyAllowedWorkspace.workspace.id),
+    /Path is outside allowed roots/,
+  );
+
   if (platform() !== "win32") {
     const aliasRoot = join(root, "alias-root");
     await symlink(root, aliasRoot, "dir");

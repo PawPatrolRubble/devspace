@@ -16,6 +16,24 @@ export interface GitEligibility {
   message?: string;
 }
 
+type GitToolContent = { type: "text"; text: string };
+
+export interface GitToolResponse extends Record<string, unknown> {
+  content: GitToolContent[];
+  isError?: boolean;
+}
+
+export interface GitDiffToolInput {
+  path?: string;
+  staged?: boolean;
+  context?: number;
+}
+
+export interface GitLogToolInput {
+  path?: string;
+  limit?: number;
+}
+
 export async function git(
   cwd: string,
   args: string[],
@@ -54,6 +72,56 @@ export async function getGitEligibility(cwd: string): Promise<GitEligibility> {
   }
 
   return { ok: true, gitRoot };
+}
+
+function gitToolResponse(text: string): GitToolResponse {
+  return { content: [{ type: "text", text }] };
+}
+
+function gitToolError(error: unknown): GitToolResponse {
+  const message = error instanceof Error ? error.message : String(error);
+  return { content: [{ type: "text", text: message }], isError: true };
+}
+
+export async function gitStatusTool(cwd: string): Promise<GitToolResponse> {
+  try {
+    const result = await git(cwd, ["status", "--short", "--branch"]);
+    return gitToolResponse(result.stdout.trimEnd() || "No changes.");
+  } catch (error) {
+    return gitToolError(error);
+  }
+}
+
+export async function gitDiffTool(cwd: string, input: GitDiffToolInput = {}): Promise<GitToolResponse> {
+  try {
+    const args = ["diff"];
+    if (input.staged) args.push("--cached");
+    if (input.context !== undefined) args.push(`--unified=${input.context}`);
+    if (input.path) args.push("--", input.path);
+
+    const result = await git(cwd, args);
+    return gitToolResponse(result.stdout.trimEnd() || "No diff.");
+  } catch (error) {
+    return gitToolError(error);
+  }
+}
+
+export async function gitLogTool(cwd: string, input: GitLogToolInput = {}): Promise<GitToolResponse> {
+  try {
+    const limit = Math.min(Math.max(input.limit ?? 10, 1), 100);
+    const args = [
+      "log",
+      `-${limit}`,
+      "--date=short",
+      "--pretty=format:%h %ad %an %s",
+    ];
+    if (input.path) args.push("--", input.path);
+
+    const result = await git(cwd, args);
+    return gitToolResponse(result.stdout.trimEnd() || "No commits.");
+  } catch (error) {
+    return gitToolError(error);
+  }
 }
 
 export function safeWorkspaceRefSegment(workspaceId: string): string {

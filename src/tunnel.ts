@@ -1,86 +1,117 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { platform } from "node:os";
 
+type ExecFileCallback = (error: ExecFileException | null, stdout: string, stderr: string) => void;
+
+type ExecFileProcessWithCallback = (
+  command: string,
+  args: string[],
+  options: {
+    encoding: "utf8";
+    timeout: number;
+    windowsHide: boolean;
+  },
+  callback: ExecFileCallback,
+) => void;
+
 export interface TunnelResult {
-  /** The captured public tunnel URL (e.g. https://something.trycloudflare.com) */
+  /** The captured public tunnel URL (e.g. https://machine.tailnet.ts.net) */
   url: string;
-  /** The cloudflared child process, for lifecycle management */
-  process: ChildProcess;
 }
 
 /**
- * Starts a cloudflared quick tunnel and resolves when the public URL is captured.
+ * Configures Tailscale Funnel in the background and resolves with the public URL.
  *
- * Equivalent to running: cloudflared tunnel --url http://127.0.0.1:{port}
+ * Equivalent to running: tailscale funnel --bg --yes {port}
  */
-export async function startCloudflareTunnel(port: number, timeoutMs = 30_000): Promise<TunnelResult> {
-  const bin = platform() === "win32" ? "cloudflared.exe" : "cloudflared";
-  const args = ["tunnel", "--url", `http://127.0.0.1:${port}`];
+export async function startTailscaleFunnel(
+  port: number,
+  timeoutMs = 30_000,
+  execFileProcess: ExecFileProcessWithCallback = execFile,
+): Promise<TunnelResult> {
+  const runner = createTailscaleRunner(execFileProcess, timeoutMs);
+  await runner(["funnel", "--bg", "--yes", String(port)]);
 
-  const proc = spawn(bin, args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  const status = await runner(["funnel", "status", "--json"]);
+  const url = extractTailscaleFunnelUrl(status.stdout);
+  if (!url) {
+    throw new Error("Tailscale Funnel did not report a public URL. Run `tailscale funnel status` to inspect it.");
+  }
 
-  return new Promise<TunnelResult>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      proc.kill();
-      reject(
-        new Error(
-          `cloudflared did not produce a tunnel URL within ${timeoutMs / 1000}s. ` +
-            "Check that cloudflared is installed and working.",
-        ),
-      );
-    }, timeoutMs);
+  return { url };
+}
 
-    let stderr = "";
+function createTailscaleRunner(execFileProcess: ExecFileProcessWithCallback, timeoutMs: number) {
+  return async (args: string[]): Promise<{ stdout: string; stderr: string }> => {
+    const bins = tailscaleBins();
+    let lastError: Error | null = null;
 
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf-8");
-    });
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf-8");
-      const url = extractTunnelUrl(text);
-
-      if (url) {
-        clearTimeout(timeout);
-        resolve({ url, process: proc });
+    for (const bin of bins) {
+      try {
+        return await runCommand(execFileProcess, bin, args, timeoutMs);
+      } catch (error) {
+        if (!isMissingExecutableError(error)) throw error;
+        lastError = error instanceof Error ? error : new Error(String(error));
       }
-    });
+    }
 
-    proc.on("error", (err: NodeJS.ErrnoException) => {
-      clearTimeout(timeout);
-      if (err.code === "ENOENT") {
-        reject(
-          new Error(
-            "cloudflared is not installed or not on PATH.\n" +
-              "Install it from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
-          ),
-        );
-      } else {
-        reject(new Error(`Failed to start cloudflared: ${err.message}`));
-      }
-    });
+    throw new Error(
+      "tailscale is not installed or not on PATH. Install Tailscale or add tailscale.exe to PATH." +
+        (lastError ? `\n${lastError.message}` : ""),
+    );
+  };
+}
 
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (code !== null && code !== 0) {
-        reject(
-          new Error(
-            `cloudflared exited with code ${code}.\n${stderr.trim()}`,
-          ),
-        );
+function runCommand(
+  execFileProcess: ExecFileProcessWithCallback,
+  command: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFileProcess(command, args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      windowsHide: true,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const details = stderr.trim();
+        reject(new Error(details ? `${error.message}\n${details}` : error.message));
+        return;
       }
+      resolve({ stdout, stderr });
     });
   });
 }
 
-/** Try to extract a trycloudflare.com URL from a line of cloudflared output. */
-function extractTunnelUrl(text: string): string | null {
-  // cloudflared outputs the URL inside a banner like:
-  // |  https://something.trycloudflare.com  |
-  // Also handles newer log formats and bare lines.
-  const match = text.match(/(https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com)/);
-  return match ? match[1] : null;
+function tailscaleBins(): string[] {
+  if (platform() !== "win32") return ["tailscale"];
+  return ["tailscale.exe", "C:\\Program Files\\Tailscale\\tailscale.exe"];
+}
+
+function isMissingExecutableError(error: unknown): boolean {
+  return error instanceof Error && /ENOENT|not recognized|cannot find/i.test(error.message);
+}
+
+function extractTailscaleFunnelUrl(text: string): string | null {
+  const status = JSON.parse(text) as {
+    Foreground?: Record<string, TailscaleServeConfig>;
+    Background?: Record<string, TailscaleServeConfig>;
+  };
+
+  for (const config of [...Object.values(status.Background ?? {}), ...Object.values(status.Foreground ?? {})]) {
+    for (const [hostPort] of Object.entries(config.AllowFunnel ?? {})) {
+      const host = hostPort.replace(/:443$/, "");
+      return `https://${host}`;
+    }
+    const webHost = Object.keys(config.Web ?? {})[0];
+    if (webHost) return `https://${webHost.replace(/:443$/, "")}`;
+  }
+
+  return null;
+}
+
+interface TailscaleServeConfig {
+  Web?: Record<string, unknown>;
+  AllowFunnel?: Record<string, boolean>;
 }

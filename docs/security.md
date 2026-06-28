@@ -57,7 +57,7 @@ metadata and connect to the correct resource.
 The value should be the origin only:
 
 ```text
-https://your-tunnel-host.example.com
+https://your-machine.your-tailnet.ts.net
 ```
 
 Do not include `/mcp` in `DEVSPACE_PUBLIC_BASE_URL`.
@@ -67,15 +67,16 @@ URL. Use `DEVSPACE_ALLOWED_HOSTS=*` only for intentional local debugging.
 
 ## Tunnels
 
-DevSpace does not manage tunnels. Your tunnel or reverse proxy should point to:
+DevSpace can configure Tailscale Funnel with `devspace serve --tunnel`. If you
+use another tunnel or reverse proxy, it should point to:
 
 ```text
 http://127.0.0.1:7676
 ```
 
-Prefer adding Cloudflare Access, Tailscale identity controls, or equivalent
-protection in front of public tunnels. DevSpace OAuth still protects the MCP
-endpoint, but the tunnel URL should not be treated as a secret.
+Prefer Tailscale identity controls, Cloudflare Access, or equivalent protection
+in front of public tunnels. DevSpace OAuth still protects the MCP endpoint, but
+the tunnel URL should not be treated as a secret.
 
 ## Shell Access
 

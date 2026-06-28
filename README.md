@@ -83,13 +83,13 @@ During setup, DevSpace asks for:
 
 - the local project folders ChatGPT is allowed to open through DevSpace
 - the local port, usually `7676`
-- your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or
-  another reverse proxy
+- your public HTTPS base URL from Tailscale Funnel, another HTTPS tunnel, or a
+  reverse proxy
 
 Use the public origin without `/mcp` during setup:
 
 ```text
-https://your-tunnel-host.example.com
+https://your-machine.your-tailnet.ts.net
 ```
 
 You will configure your MCP client with the public `/mcp` URL after setup.
@@ -111,10 +111,21 @@ The default local endpoint is:
 http://127.0.0.1:7676/mcp
 ```
 
+The local DevSpace console is available on the same server:
+
+```text
+http://127.0.0.1:7676/app
+```
+
+The console shows service status, MCP URLs, allowed roots, OAuth boundaries,
+logging settings, local storage paths, and a live record of recent MCP tool
+interactions. It is intentionally localhost-only; keep using `/mcp` as the URL
+you expose to MCP clients through a tunnel.
+
 Most users should connect through a public HTTPS tunnel:
 
 ```text
-https://your-tunnel-host.example.com/mcp
+https://your-machine.your-tailnet.ts.net/mcp
 ```
 
 ## What ChatGPT Can Do
@@ -127,7 +138,8 @@ DevSpace gives ChatGPT tools to:
 
 - read, write, and edit files inside the opened workspace
 - search code and inspect directories
-- run shell commands for tests, builds, git, and package scripts
+- inspect Git status, diffs, and recent history without shell commands
+- run shell commands for tests, builds, and package scripts
 - use isolated Git worktrees for parallel coding sessions
 - follow project instructions from `AGENTS.md` and `CLAUDE.md`
 - discover local agent skills from your skill folders
@@ -143,8 +155,8 @@ connected client like a trusted coding partner with access to your machine.
 
 For a normal ChatGPT coding session:
 
-1. Start your tunnel.
-2. Run `devspace serve`.
+1. Run `devspace serve --tunnel` to configure Tailscale Funnel automatically.
+2. Or start your own HTTPS tunnel and run `devspace serve`.
 3. Connect the MCP client to your public `/mcp` URL.
 4. Approve the connection with the Owner password.
 5. Ask ChatGPT to open a project inside one of your allowed roots.

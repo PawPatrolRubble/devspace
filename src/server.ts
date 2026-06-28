@@ -20,11 +20,18 @@ import * as z from "zod/v4";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   logEvent,
+  serverLogSnapshot,
+  subscribeServerLogs,
   requestIp,
   requestPath,
   commandPreview,
   sessionIdPrefix,
 } from "./logger.js";
+import {
+  gitDiffTool,
+  gitLogTool,
+  gitStatusTool,
+} from "./git.js";
 import {
   editFileTool,
   findFilesTool,
@@ -39,10 +46,12 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import { InteractionLog } from "./interaction-log.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
+const DASHBOARD_APP_MANIFEST_ENTRY = "dashboard-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -61,6 +70,7 @@ const SHELL_TOOL_ANNOTATIONS = {
   idempotentHint: false,
   openWorldHint: true,
 };
+const interactionLogs = new WeakMap<ServerConfig, InteractionLog>();
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -200,7 +210,7 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges} When using ${toolNames.edit} with multiple edits in one call: all edits[].oldText values are matched against the ORIGINAL file content simultaneously, not sequentially. If edit #2 depends on edit #1's result, use two separate ${toolNames.edit} calls instead. Each edits[].oldText must be unique in the file; if the same text appears multiple times, include additional surrounding context to make it unique. Overlapping edits[].oldText ranges are rejected — merge overlapping or nearby changes into a single edit with a larger oldText.`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, git, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, git_status/git_diff/git_log for read-only git inspection, and ${toolNames.shell} for tests, builds, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges} When using ${toolNames.edit} with multiple edits in one call: all edits[].oldText values are matched against the ORIGINAL file content simultaneously, not sequentially. If edit #2 depends on edit #1's result, use two separate ${toolNames.edit} calls instead. Each edits[].oldText must be unique in the file; if the same text appears multiple times, include additional surrounding context to make it unique. Overlapping edits[].oldText ranges are rejected — merge overlapping or nearby changes into a single edit with a larger oldText.`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -267,12 +277,22 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
 }
 
 function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
+  const { command, ...safeFields } = fields;
+  const sanitizedCommandPreview = config.logging.shellCommands && command
+    ? commandPreview(command)
+    : undefined;
+
+  interactionLogs.get(config)?.recordToolCall({
+    ...safeFields,
+    commandPreview: sanitizedCommandPreview,
+    commandRedacted: Boolean(command && !config.logging.shellCommands),
+  });
+
   if (!config.logging.toolCalls) return;
 
-  const { command, ...safeFields } = fields;
   logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
     ...safeFields,
-    commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
+    commandPreview: sanitizedCommandPreview,
   });
 }
 
@@ -403,15 +423,23 @@ function readWorkspaceAppManifest(): WorkspaceAppManifest {
   return JSON.parse(readFileSync(uiManifestUrl(), "utf8")) as WorkspaceAppManifest;
 }
 
-function getWorkspaceAppManifestEntry(): WorkspaceAppManifestEntry {
+function getUiManifestEntry(entryName: string): WorkspaceAppManifestEntry {
   const manifest = readWorkspaceAppManifest();
-  const entry = manifest[WORKSPACE_APP_MANIFEST_ENTRY];
+  const entry = manifest[entryName];
 
   if (!entry?.file) {
-    throw new Error(`Missing ${WORKSPACE_APP_MANIFEST_ENTRY} in UI manifest.`);
+    throw new Error(`Missing ${entryName} in UI manifest.`);
   }
 
   return entry;
+}
+
+function getWorkspaceAppManifestEntry(): WorkspaceAppManifestEntry {
+  return getUiManifestEntry(WORKSPACE_APP_MANIFEST_ENTRY);
+}
+
+function getDashboardAppManifestEntry(): WorkspaceAppManifestEntry {
+  return getUiManifestEntry(DASHBOARD_APP_MANIFEST_ENTRY);
 }
 
 function assetUrl(baseUrl: string, assetPath: string): string {
@@ -445,6 +473,33 @@ ${stylesheets}
 </html>`;
 }
 
+function dashboardAppHtml(config: ServerConfig): string {
+  const baseUrl = "/mcp-app-assets";
+  const entry = getDashboardAppManifestEntry();
+  const stylesheets = (entry.css ?? [])
+    .map(
+      (stylesheet) =>
+        `    <link rel="stylesheet" crossorigin href="${assetUrl(baseUrl, stylesheet)}" />`,
+    )
+    .join("\n");
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DevSpace Console</title>
+    <script type="module" crossorigin src="${assetUrl(baseUrl, entry.file)}"></script>
+${stylesheets}
+  </head>
+  <body>
+    <main id="dashboard-root" class="dashboard-shell">
+      <section class="dashboard-loading">Loading DevSpace...</section>
+    </main>
+  </body>
+</html>`;
+}
+
 function appCsp(config: ServerConfig): {
   resourceDomains: string[];
   connectDomains: string[];
@@ -468,7 +523,15 @@ function setAssetHeaders(res: Response): void {
 }
 
 async function assertWorkspaceAppAssets(): Promise<void> {
-  const entry = getWorkspaceAppManifestEntry();
+  await assertUiEntryAssets(WORKSPACE_APP_MANIFEST_ENTRY);
+}
+
+async function assertDashboardAppAssets(): Promise<void> {
+  await assertUiEntryAssets(DASHBOARD_APP_MANIFEST_ENTRY);
+}
+
+async function assertUiEntryAssets(entryName: string): Promise<void> {
+  const entry = getUiManifestEntry(entryName);
   const candidates = [entry.file, ...(entry.css ?? [])].map(
     (assetPath) => new URL(`../dist/ui/${assetPath}`, import.meta.url),
   );
@@ -476,6 +539,101 @@ async function assertWorkspaceAppAssets(): Promise<void> {
   for (const candidate of candidates) {
     await access(candidate);
   }
+}
+
+function localServerBaseUrl(config: ServerConfig): string {
+  const publicHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
+  const formattedHost = publicHost.includes(":") && !publicHost.startsWith("[")
+    ? `[${publicHost}]`
+    : publicHost;
+  return `http://${formattedHost}:${config.port}`;
+}
+
+export function dashboardStatus(
+  config: ServerConfig,
+  activeMcpSessions: number,
+  interactions: InteractionLog,
+): Record<string, unknown> {
+  const localBaseUrl = localServerBaseUrl(config);
+
+  return {
+    ok: true,
+    name: "devspace",
+    uptimeSeconds: Math.round(process.uptime()),
+    server: {
+      host: config.host,
+      port: config.port,
+      localMcpUrl: new URL("/mcp", localBaseUrl).toString(),
+      publicMcpUrl: new URL("/mcp", config.publicBaseUrl).toString(),
+      localDashboardUrl: new URL("/app", localBaseUrl).toString(),
+      publicBaseUrl: config.publicBaseUrl,
+      node: process.version,
+      platform: `${process.platform}/${process.arch}`,
+      activeMcpSessions,
+    },
+    access: {
+      dashboard: "localhost-only",
+      allowedRoots: config.allowedRoots,
+      allowedHosts: config.allowedHosts,
+      oauthOwnerToken: config.oauth.ownerToken,
+      oauthScopes: config.oauth.scopes,
+      oauthRedirectHosts: config.oauth.allowedRedirectHosts,
+    },
+    features: {
+      toolMode: config.minimalTools ? "minimal" : "full",
+      toolNaming: config.toolNaming,
+      widgets: config.widgets,
+      skills: config.skillsEnabled,
+    },
+    storage: {
+      stateDir: config.stateDir,
+      worktreeRoot: config.worktreeRoot,
+      agentDir: config.agentDir,
+    },
+    interactions: interactions.summary(),
+    logging: config.logging,
+    logs: serverLogSnapshot(),
+  };
+}
+
+function isLocalDashboardRequest(req: Request): boolean {
+  const host = requestHostName(req);
+  if (!host) return false;
+
+  return host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+function requestHostName(req: Request): string | undefined {
+  const hostHeader = req.header("host");
+  if (!hostHeader) return undefined;
+
+  try {
+    return new URL(`http://${hostHeader}`).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+export function shouldLogHttpRequest(config: ServerConfig, path: string): boolean {
+  if (!config.logging.requests) return false;
+  if (!config.logging.assets && path.startsWith("/mcp-app-assets")) return false;
+  if (path === "/app/status") return false;
+  return true;
+}
+
+function rejectRemoteDashboardRequest(req: Request, res: Response): boolean {
+  if (isLocalDashboardRequest(req)) return false;
+
+  res
+    .status(403)
+    .type("text/plain")
+    .send("DevSpace dashboard is available only from localhost.");
+  return true;
+}
+
+function writeSseEvent(res: Response, event: string, data: unknown): void {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
 function createMcpServer(
@@ -995,6 +1153,211 @@ IMPORTANT matching rules:
     );
   }
 
+  registerAppTool(
+    server,
+    "git_status",
+    {
+      title: "Git status",
+      description:
+        "Show read-only Git status for an open workspace. Prefer this over shell commands for checking changed files. Call open_workspace first and pass workspaceId.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+      },
+      outputSchema: resultOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "search"),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitStatusTool(workspace.root);
+
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: "git_status",
+          workspaceId,
+        }, response.content, startedAt);
+        return response;
+      }
+
+      const summary = textSummary(response.content);
+      logToolCall(config, {
+        tool: "git_status",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        ...response,
+        _meta: {
+          tool: "git_status",
+          card: {
+            workspaceId,
+            summary,
+            payload: { content: response.content },
+          },
+        },
+        structuredContent: {
+          result: contentText(response.content),
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_diff",
+    {
+      title: "Git diff",
+      description:
+        "Show a read-only Git diff for an open workspace. Prefer this over shell commands for inspecting file changes. Call open_workspace first and pass workspaceId.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        path: z
+          .string()
+          .optional()
+          .describe("Optional file or directory path relative to the workspace root."),
+        staged: z
+          .boolean()
+          .optional()
+          .describe("When true, show staged changes with git diff --cached."),
+        context: z
+          .number()
+          .int()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe("Optional number of context lines for the diff. Defaults to Git's default."),
+      },
+      outputSchema: resultOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "search"),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      if (input.path) workspaces.resolvePath(workspace, input.path);
+      const response = await gitDiffTool(workspace.root, input);
+
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: "git_diff",
+          workspaceId,
+          path: input.path,
+        }, response.content, startedAt);
+        return response;
+      }
+
+      const summary = {
+        scope: input.path ?? ".",
+        staged: input.staged ?? false,
+        ...countDiffStats(contentText(response.content)),
+        ...textSummary(response.content),
+      };
+      logToolCall(config, {
+        tool: "git_diff",
+        workspaceId,
+        path: input.path,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        ...response,
+        _meta: {
+          tool: "git_diff",
+          card: {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: { content: response.content },
+          },
+        },
+        structuredContent: {
+          result: contentText(response.content),
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_log",
+    {
+      title: "Git log",
+      description:
+        "Show recent Git commits for an open workspace. Prefer this over shell commands for commit history inspection. Call open_workspace first and pass workspaceId.",
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        path: z
+          .string()
+          .optional()
+          .describe("Optional file or directory path relative to the workspace root."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Maximum number of commits to show. Defaults to 10, max 100."),
+      },
+      outputSchema: resultOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "search"),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      if (input.path) workspaces.resolvePath(workspace, input.path);
+      const response = await gitLogTool(workspace.root, input);
+
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: "git_log",
+          workspaceId,
+          path: input.path,
+        }, response.content, startedAt);
+        return response;
+      }
+
+      const summary = {
+        scope: input.path ?? ".",
+        limit: input.limit ?? 10,
+        ...textSummary(response.content),
+      };
+      logToolCall(config, {
+        tool: "git_log",
+        workspaceId,
+        path: input.path,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        ...response,
+        _meta: {
+          tool: "git_log",
+          card: {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: { content: response.content },
+          },
+        },
+        structuredContent: {
+          result: contentText(response.content),
+        },
+      };
+    },
+  );
+
   if (!config.minimalTools) {
     registerAppTool(
       server,
@@ -1319,6 +1682,8 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
+  const interactions = new InteractionLog();
+  interactionLogs.set(config, interactions);
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -1331,8 +1696,7 @@ export function createServer(config = loadConfig()): RunningServer {
 
     res.on("finish", () => {
       const path = requestPath(req);
-      if (!config.logging.requests) return;
-      if (!config.logging.assets && path.startsWith("/mcp-app-assets")) return;
+      if (!shouldLogHttpRequest(config, path)) return;
 
       logEvent(config.logging, "info", "http_request", {
         requestId,
@@ -1372,6 +1736,62 @@ export function createServer(config = loadConfig()): RunningServer {
       setHeaders: setAssetHeaders,
     }),
   );
+
+  app.get("/app/status", (req, res) => {
+    if (rejectRemoteDashboardRequest(req, res)) return;
+
+    res.json(dashboardStatus(config, transports.size, interactions));
+  });
+
+  app.get("/app/interactions", (req, res) => {
+    if (rejectRemoteDashboardRequest(req, res)) return;
+
+    res.json(interactions.snapshot());
+  });
+
+  app.get("/app/events", (req, res) => {
+    if (rejectRemoteDashboardRequest(req, res)) return;
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    writeSseEvent(res, "snapshot", interactions.snapshot());
+    writeSseEvent(res, "logs_snapshot", serverLogSnapshot());
+    const unsubscribeInteractions = interactions.subscribe((event) => {
+      writeSseEvent(res, "interaction", {
+        event,
+        summary: interactions.summary(),
+      });
+    });
+    const unsubscribeLogs = subscribeServerLogs((entry) => {
+      writeSseEvent(res, "server_log", { entry });
+    });
+    const heartbeat = setInterval(() => {
+      res.write(": heartbeat\n\n");
+    }, 25000);
+    heartbeat.unref?.();
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      unsubscribeInteractions();
+      unsubscribeLogs();
+      res.end();
+    });
+  });
+
+  app.get(["/app", "/app/"], async (req, res, next) => {
+    if (rejectRemoteDashboardRequest(req, res)) return;
+
+    try {
+      await assertDashboardAppAssets();
+      res.type("html").send(dashboardAppHtml(config));
+    } catch (error) {
+      next(error);
+    }
+  });
 
   app.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "devspace" });
@@ -1482,6 +1902,7 @@ export function createServer(config = loadConfig()): RunningServer {
     close: () => {
       if (closed) return;
       closed = true;
+      interactionLogs.delete(config);
       oauthProvider.close();
       workspaceStore.close?.();
     },
@@ -1502,6 +1923,7 @@ if (await isMainModule()) {
     console.log(
       `devspace listening on http://${config.host}:${config.port}/mcp`,
     );
+    console.log(`local dashboard: ${new URL("/app", localServerBaseUrl(config)).toString()}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log("auth: oauth owner-token flow required");
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
