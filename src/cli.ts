@@ -16,6 +16,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { startTailscaleFunnel } from "./tunnel.js";
+import { resolveSshRelayOptions, startSshRelay, type SshRelayController } from "./ssh-relay.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -25,14 +26,16 @@ async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
 
   const useTunnel = parseTunnelFlag(argv);
-  const filteredArgs = argv.filter((arg) => arg !== "--tunnel");
+  const useRelay = argv.includes("--relay");
+  if (useTunnel && useRelay) throw new Error("--tunnel and --relay are mutually exclusive.");
+  const filteredArgs = argv.filter((arg) => arg !== "--tunnel" && arg !== "--relay");
   const [rawCommand, ...args] = filteredArgs;
   const command = normalizeCommand(rawCommand);
 
   switch (command) {
     case "serve":
       await ensureConfigured();
-      await serve({ useTunnel });
+      await serve({ useTunnel, useRelay });
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -170,7 +173,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   }
 }
 
-async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
+async function serve(opts: { useTunnel?: boolean; useRelay?: boolean } = {}): Promise<void> {
   const sqliteStatus = checkSqliteNative();
   if (sqliteStatus !== "ok") {
     throw new Error(
@@ -204,7 +207,17 @@ async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
 
   const { createServer } = await import("./server.js");
   const config = loadConfig();
+  const relayOptions = opts.useRelay
+    ? resolveSshRelayOptions(loadDevspaceFiles().config.relay, config.port)
+    : undefined;
+  if (relayOptions && config.host !== "127.0.0.1") {
+    throw new Error("SSH relay mode requires HOST=127.0.0.1.");
+  }
+  if (relayOptions && new URL(config.publicBaseUrl).protocol !== "https:") {
+    throw new Error("SSH relay mode requires an HTTPS publicBaseUrl.");
+  }
   const { app, close } = createServer(config);
+  let relayController: SshRelayController | undefined;
   const httpServer = app.listen(config.port, config.host, () => {
     const localBaseUrl = localHttpBaseUrl(config.host, config.port);
     const publicMcpUrl = new URL("/mcp", config.publicBaseUrl).toString();
@@ -221,9 +234,15 @@ async function serve(opts: { useTunnel?: boolean } = {}): Promise<void> {
     console.log(`  Auth: Owner password required`);
     console.log(`  Logs: ${config.logging.level} ${config.logging.format}`);
     console.log();
+    if (relayOptions) {
+      relayController = startSshRelay(relayOptions, {
+        onEvent: (message) => console.log(`[ssh-relay] ${message}`),
+      });
+    }
   });
 
   const shutdown = () => {
+    relayController?.stop();
     httpServer.close(() => {
       close();
       process.exit(0);
@@ -307,7 +326,7 @@ function printHelp(): void {
       "",
       "Usage:",
       "  devspace                      Run first-time setup if needed, then start the server",
-      "  devspace serve [--tunnel]     Start the server",
+      "  devspace serve [--tunnel|--relay]  Start the server",
       "  devspace init                 Create or update ~/.devspace/config.json and auth.json",
       "  devspace doctor               Show config, runtime, and native dependency status",
       "  devspace config get           Print persisted config",
@@ -319,6 +338,8 @@ function printHelp(): void {
       "                                the returned URL as DEVSPACE_PUBLIC_BASE_URL and persist it",
       "                                to config.json.",
       "                                Requires: tailscale installed and Funnel enabled.",
+      "  --relay                       Use your own SSH + Nginx server as the relay.",
+      "                                Configure relay.host and relay.user in config.json.",
       "",
       "For manual tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://machine.tailnet.ts.net devspace serve",
