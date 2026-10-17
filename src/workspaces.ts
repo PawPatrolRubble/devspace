@@ -5,7 +5,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree } from "./git-worktrees.js";
-import { assertAllowedPath, isPathInsideRoot, resolveAllowedPath } from "./roots.js";
+import { assertAllowedPath, canonicalAllowedPath, isPathInsideRoot, resolveCanonicalAllowedPath } from "./roots.js";
 import {
   loadWorkspaceSkills,
   markSkillActivated,
@@ -35,6 +35,7 @@ export interface WorkspaceWorktree {
 export interface Workspace {
   id: string;
   root: string;
+  canonicalRoot: string;
   mode: WorkspaceMode;
   sourceRoot?: string;
   worktree?: WorkspaceWorktree;
@@ -85,6 +86,10 @@ export class WorkspaceRegistry {
     if (workspace) {
       try {
         this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+        const roots = workspace.mode === "worktree" ? [this.config.worktreeRoot] : this.config.allowedRoots;
+        if (canonicalAllowedPath(workspace.root, roots) !== workspace.canonicalRoot) {
+          throw new Error(`Workspace root changed after opening: ${workspace.root}`);
+        }
       } catch (error) {
         this.workspaces.delete(workspaceId);
         throw error;
@@ -102,6 +107,7 @@ export class WorkspaceRegistry {
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
+      canonicalRoot: canonicalAllowedPath(root, session.mode === "worktree" ? [this.config.worktreeRoot] : this.config.allowedRoots),
       mode: session.mode,
       sourceRoot: session.sourceRoot,
       worktree:
@@ -125,7 +131,7 @@ export class WorkspaceRegistry {
   }
 
   resolvePath(workspace: Workspace, inputPath: string): string {
-    const absolutePath = resolveAllowedPath(inputPath, workspace.root, [workspace.root]);
+    const absolutePath = resolveCanonicalAllowedPath(inputPath, workspace.root, [workspace.root]);
     if (!isPathInsideRoot(absolutePath, workspace.root)) {
       throw new Error(`Path is outside workspace root: ${inputPath}`);
     }
@@ -163,11 +169,12 @@ export class WorkspaceRegistry {
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
     const directory = workingDirectory ? this.resolvePath(workspace, workingDirectory) : workspace.root;
-    return assertAllowedPath(directory, [workspace.root]);
+    return resolveCanonicalAllowedPath(directory, workspace.root, [workspace.root]);
   }
 
   private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
+    canonicalAllowedPath(root, this.config.allowedRoots);
     await mkdir(root, { recursive: true });
 
     const rootStats = await stat(root);
@@ -179,6 +186,7 @@ export class WorkspaceRegistry {
   }
 
   private async openWorktreeWorkspace(path: string, baseRef: string | undefined): Promise<WorkspaceContext> {
+    canonicalAllowedPath(path, this.config.allowedRoots);
     const worktree = await createManagedWorktree({
       sourcePath: path,
       baseRef,
@@ -202,6 +210,7 @@ export class WorkspaceRegistry {
     const workspace: Workspace = {
       id: `ws_${randomUUID()}`,
       root: input.root,
+      canonicalRoot: canonicalAllowedPath(input.root, input.mode === "worktree" ? [this.config.worktreeRoot] : this.config.allowedRoots),
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
@@ -238,11 +247,11 @@ export class WorkspaceRegistry {
       if (!sourceRoot) {
         throw new Error(`Stored worktree workspace is missing sourceRoot: ${root}`);
       }
-      assertAllowedPath(sourceRoot, this.config.allowedRoots);
-      return assertAllowedPath(root, [this.config.worktreeRoot]);
+      canonicalAllowedPath(sourceRoot, this.config.allowedRoots);
+      return resolveCanonicalAllowedPath(root, root, [this.config.worktreeRoot]);
     }
 
-    return assertAllowedPath(root, this.config.allowedRoots);
+    return resolveCanonicalAllowedPath(root, root, this.config.allowedRoots);
   }
 
   private loadInitialAgentsFiles(root: string): LoadedAgentsFile[] {
