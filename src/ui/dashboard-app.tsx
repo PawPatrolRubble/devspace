@@ -21,7 +21,6 @@ interface DashboardStatus {
     dashboard: string;
     allowedRoots: string[];
     allowedHosts: string[];
-    oauthOwnerToken: string;
     oauthScopes: string[];
     oauthRedirectHosts: string[];
   };
@@ -281,7 +280,6 @@ function DashboardApp() {
         <RouteStep label="Console" value={status.server.localDashboardUrl} tone="local" />
         <RouteStep label="Domain" value={status.server.publicBaseUrl} tone="public" />
         <RouteStep label="MCP" value={status.server.publicMcpUrl} tone="mcp" />
-        <RouteStep label="OAuth key" value={status.access.oauthOwnerToken} tone="oauth" />
       </section>
 
       <section className="metric-grid" aria-label="Runtime summary">
@@ -308,7 +306,6 @@ function DashboardApp() {
 
         <Panel title="Access" eyebrow="Security boundary">
           <FactRow label="Dashboard" value={status.access.dashboard} />
-          <EndpointRow label="OAuth key" value={status.access.oauthOwnerToken} />
           <FactRow label="OAuth scopes" value={status.access.oauthScopes.join(", ") || "none"} />
           <TagList label="Allowed hosts" values={status.access.allowedHosts} />
           <PathList label="Allowed roots" paths={status.access.allowedRoots} />

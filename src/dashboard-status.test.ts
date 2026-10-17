@@ -43,7 +43,6 @@ const status = dashboardStatus(config, 2, interactions) as {
     activeMcpSessions: number;
   };
   access: {
-    oauthOwnerToken: string;
     oauthScopes: string[];
   };
 };
@@ -51,7 +50,7 @@ const status = dashboardStatus(config, 2, interactions) as {
 assert.equal(status.server.publicBaseUrl, "https://latest.taildea223.ts.net");
 assert.equal(status.server.publicMcpUrl, "https://latest.taildea223.ts.net/mcp");
 assert.equal(status.server.activeMcpSessions, 2);
-assert.equal(status.access.oauthOwnerToken, "test-owner-token-that-is-long-enough");
+assert.equal(JSON.stringify(status).includes(config.oauth.ownerToken), false);
 assert.deepEqual(status.access.oauthScopes, ["devspace"]);
 
 assert.equal(shouldLogHttpRequest(config, "/app/status"), false);

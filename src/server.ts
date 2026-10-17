@@ -575,7 +575,6 @@ export function dashboardStatus(
       dashboard: "localhost-only",
       allowedRoots: config.allowedRoots,
       allowedHosts: config.allowedHosts,
-      oauthOwnerToken: config.oauth.ownerToken,
       oauthScopes: config.oauth.scopes,
       oauthRedirectHosts: config.oauth.allowedRedirectHosts,
     },

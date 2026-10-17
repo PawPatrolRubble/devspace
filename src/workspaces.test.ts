@@ -121,6 +121,28 @@ try {
   );
 
   if (platform() !== "win32") {
+    const outside = await mkdtemp(join(tmpdir(), "devspace-outside-workspace-test-"));
+    try {
+      const escape = join(root, "linked-outside");
+      await symlink(outside, escape, "dir");
+      await assert.rejects(
+        () => registry.openWorkspace(join(escape, "new-project")),
+        /outside allowed roots/,
+      );
+      const safe = join(root, "safe-project");
+      const changingLink = join(root, "changing-link");
+      await mkdir(safe);
+      await symlink(safe, changingLink, "dir");
+      const opened = await registry.openWorkspace(changingLink);
+      await rm(changingLink);
+      await symlink(outside, changingLink, "dir");
+      assert.throws(() => registry.getWorkspace(opened.workspace.id), /outside allowed roots|root changed after opening/);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  }
+
+  if (platform() !== "win32") {
     const aliasRoot = join(root, "alias-root");
     await symlink(root, aliasRoot, "dir");
     const aliasConfig = loadConfig({
