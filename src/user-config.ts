@@ -8,8 +8,10 @@ import {
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
+import type { SshRelayConfig } from "./ssh-relay.js";
 
 export interface DevspaceUserConfig {
+  relay?: SshRelayConfig;
   host?: string;
   port?: number;
   allowedRoots?: string[];
